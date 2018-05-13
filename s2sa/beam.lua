@@ -50,6 +50,8 @@ cmd:option('-cudnn', 0, [[If using character model, this should be = 1 if the ch
 cmd:option('-rescore', '', [[use specified metric to select best translation in the beam, available: bleu, gleu]])
 cmd:option('-rescore_param', 4, [[parameter for the scoring metric, for BLEU is corresponding to n_gram ]])
 
+cmd:option('-mask', '', [[specify mask in the format #neuron,#neuron,#neuron....]])
+
 function copy(orig)
   local orig_type = type(orig)
   local copy
@@ -410,6 +412,539 @@ function generate_beam(model, initial, K, max_sent_l, source, source_features, g
   return max_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax
 end
 
+
+function generate_beam_with_mask(model, initial, K, max_sent_l, source, source_features, gold, mask)
+  --reset decoder initial states
+  if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+    cutorch.setDevice(opt.gpuid)
+  end
+  local n = max_sent_l
+  -- Backpointer table.
+  local prev_ks = torch.LongTensor(n, K):fill(1)
+  -- Current States.
+  local next_ys = torch.LongTensor(n, K):fill(1)
+  -- Current Scores.
+  local scores = torch.FloatTensor(n, K)
+  scores:zero()
+  local source_l = math.min(source:size(1), opt.max_sent_l)
+  local attn_argmax = {} -- store attn weights
+  attn_argmax[1] = {}
+
+  local states = {} -- store predicted word idx
+  states[1] = {}
+  for k = 1, 1 do
+    table.insert(states[1], initial)
+    table.insert(attn_argmax[1], initial)
+    next_ys[1][k] = State.next(initial)
+  end
+
+  local source_input
+  if model_opt.use_chars_enc == 1 then
+    source_input = source:view(source_l, 1, source:size(2)):contiguous()
+  else
+    source_input = source:view(source_l, 1)
+  end
+  -- print(source_input)
+  local rnn_state_enc = {}
+  for i = 1, #init_fwd_enc do
+    table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
+  end
+  local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+
+  for t = 1, source_l do
+    local encoder_input = {source_input[t]}
+    if model_opt.num_source_features > 0 then
+      append_table(encoder_input, source_features[t])
+    end
+    append_table(encoder_input, rnn_state_enc)
+    
+    --print('=========================')
+    --for i = 1, #encoder_input do
+    --  print(encoder_input[i]:sum())
+    --end
+    --print('--------')
+    --local out = model[1]:forward(encoder_input)
+    -- print('---------------------')
+    
+    local temp_input = encoder_input
+    
+    -- 1: identity layer
+    local moduleNum = 1
+    -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+    temp_input = model[1].modules[moduleNum]:forward(temp_input)
+    moduleNum = moduleNum + 1
+    
+    -- Now layerwise decoding
+    local offset = 0
+    local outputs = {}
+    for L = 1, model_opt.num_layers do
+        local prev_c = temp_input[L*2+offset]
+        local prev_h = temp_input[L*2+1+offset]
+        
+        local x
+        if L == 1 then
+          -- 2: Word Embedding layer
+          -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+          x = model[1].modules[moduleNum]:forward(temp_input[1])
+          moduleNum = moduleNum + 1
+        else
+          x = outputs[(L-1)*2]
+          if model_opt.dropout > 0 then
+            --print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+            --print("dropout")
+            x = model[1].modules[moduleNum]:forward(x)
+            moduleNum = moduleNum + 1
+          end
+        end
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local i2h = model[1].modules[moduleNum]:forward(x)
+        moduleNum = moduleNum + 1
+        
+        --ignore identity
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local h2h = model[1].modules[moduleNum]:forward(prev_h)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local all_input_sums = model[1].modules[moduleNum]:forward({i2h, h2h})
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local reshaped = model[1].modules[moduleNum]:forward(all_input_sums)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local n1, n2, n3, n4 = unpack(model[1].modules[moduleNum]:forward(reshaped))
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local forget_gate = model[1].modules[moduleNum]:forward(n2)
+        moduleNum = moduleNum + 1
+        
+        --ignore identity
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        -- print("next_c_1")
+        local next_c_1 = model[1].modules[moduleNum]:forward({forget_gate, prev_c})
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local in_gate = model[1].modules[moduleNum]:forward(n1)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local in_transform = model[1].modules[moduleNum]:forward(n4)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        -- print("next_c_2")
+        local next_c_2 = model[1].modules[moduleNum]:forward({in_gate, in_transform})
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        -- print("next_c")
+        local next_c = model[1].modules[moduleNum]:forward({next_c_1, next_c_2})
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local out_gate = model[1].modules[moduleNum]:forward(n3)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local tanh_temp = model[1].modules[moduleNum]:forward(next_c)
+        moduleNum = moduleNum + 1
+        
+        -- print(string.format("%d: %s", moduleNum, model[1].modules[moduleNum]))
+        local next_h = model[1].modules[moduleNum]:forward({out_gate, tanh_temp})
+        moduleNum = moduleNum + 1
+        
+        -- mask outputs
+        -- print('F', L, next_h:sum())
+        next_h[mask[L]] = 0
+        -- print('F', L, next_h:sum())
+        
+        table.insert(outputs, next_c)
+        table.insert(outputs, next_h)
+    end
+    -- for i,module in ipairs(model[1]:listModules()) do
+    --   -- print(module)
+    -- end
+    
+    --assert(#out == #outputs)
+    --for i = 1, #outputs do
+    --  assert(torch.all(torch.eq(out[i], outputs[i])))
+    --  print(torch.sum(outputs[i]))
+    --end
+    --print('---------------------')
+    rnn_state_enc = outputs
+    context[{{},t}]:copy(outputs[#outputs])
+  end
+  rnn_state_dec = {}
+  for i = 1, #init_fwd_dec do
+    table.insert(rnn_state_dec, init_fwd_dec[i]:zero())
+  end
+
+  if model_opt.init_dec == 1 then
+    for L = 1, model_opt.num_layers do
+      rnn_state_dec[L*2-1+model_opt.input_feed]:copy(
+        rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+      rnn_state_dec[L*2+model_opt.input_feed]:copy(
+        rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+    end
+  end
+  if model_opt.brnn == 1 then
+    for i = 1, #rnn_state_enc do
+      rnn_state_enc[i]:zero()
+    end
+    for t = source_l, 1, -1 do
+      local encoder_input = {source_input[t]}
+      if model_opt.num_source_features > 0 then
+        append_table(encoder_input, source_features[t])
+      end
+      append_table(encoder_input, rnn_state_enc)
+      -- local out = model[4]:forward(encoder_input)
+      
+      ------------------------------------------------------------------------------
+      local temp_input = encoder_input
+      --print('===brnn======================')
+      --for i = 1, #encoder_input do
+      --  print(encoder_input[i]:sum())
+      --end
+      --print('---brnn-----')
+    
+      -- 1: identity layer
+      local moduleNum = 1
+      -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+      temp_input = model[4].modules[moduleNum]:forward(temp_input)
+      moduleNum = moduleNum + 1
+      
+      -- Now layerwise decoding
+      local offset = 0
+      local outputs = {}
+      for L = 1, model_opt.num_layers do
+          local prev_c = temp_input[L*2+offset]
+          local prev_h = temp_input[L*2+1+offset]
+          
+          local x
+          if L == 1 then
+            -- 2: Word Embedding layer
+            -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+            x = model[4].modules[moduleNum]:forward(temp_input[1])
+            moduleNum = moduleNum + 1
+          else
+            x = outputs[(L-1)*2]
+            if model_opt.dropout > 0 then
+              -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+              x = model[4].modules[moduleNum]:forward(x)
+              moduleNum = moduleNum + 1
+            end
+          end
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local i2h = model[4].modules[moduleNum]:forward(x)
+          moduleNum = moduleNum + 1
+          
+          --ignore identity
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local h2h = model[4].modules[moduleNum]:forward(prev_h)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local all_input_sums = model[4].modules[moduleNum]:forward({i2h, h2h})
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local reshaped = model[4].modules[moduleNum]:forward(all_input_sums)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local n1, n2, n3, n4 = unpack(model[4].modules[moduleNum]:forward(reshaped))
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local forget_gate = model[4].modules[moduleNum]:forward(n2)
+          moduleNum = moduleNum + 1
+          
+          --ignore identity
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          -- print("next_c_1")
+          local next_c_1 = model[4].modules[moduleNum]:forward({forget_gate, prev_c})
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local in_gate = model[4].modules[moduleNum]:forward(n1)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local in_transform = model[4].modules[moduleNum]:forward(n4)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          -- print("next_c_2")
+          local next_c_2 = model[4].modules[moduleNum]:forward({in_gate, in_transform})
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          -- print("next_c")
+          local next_c = model[4].modules[moduleNum]:forward({next_c_1, next_c_2})
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local out_gate = model[4].modules[moduleNum]:forward(n3)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local tanh_temp = model[4].modules[moduleNum]:forward(next_c)
+          moduleNum = moduleNum + 1
+          
+          -- print(string.format("%d: %s", moduleNum, model[4].modules[moduleNum]))
+          local next_h = model[4].modules[moduleNum]:forward({out_gate, tanh_temp})
+          moduleNum = moduleNum + 1
+          
+          -- mask outputs
+          -- print('B', L, next_h:sum())
+          next_h[mask[model_opt.num_layers + L]] = 0
+          -- print('B', L, next_h:sum())
+          
+          table.insert(outputs, next_c)
+          table.insert(outputs, next_h)
+      end
+      ------------------------------------------------------------------------------
+
+      -- assert(#out == #outputs)
+      --for i = 1, #outputs do
+        -- assert(torch.all(torch.eq(out[i], outputs[i])))
+      --  print(outputs[i]:sum())
+      --end
+      --print('---------------------')
+      
+      rnn_state_enc = outputs
+      context[{{},t}]:add(outputs[#outputs])
+    end
+    if model_opt.init_dec == 1 then
+      for L = 1, model_opt.num_layers do
+        rnn_state_dec[L*2-1+model_opt.input_feed]:add(
+          rnn_state_enc[L*2-1]:expand(K, model_opt.rnn_size))
+        rnn_state_dec[L*2+model_opt.input_feed]:add(
+          rnn_state_enc[L*2]:expand(K, model_opt.rnn_size))
+      end
+    end
+  end
+  if opt.score_gold == 1 then
+    rnn_state_dec_gold = {}
+    for i = 1, #rnn_state_dec do
+      table.insert(rnn_state_dec_gold, rnn_state_dec[i][{{1}}]:clone())
+    end
+  end
+
+  context = context:expand(K, source_l, model_opt.rnn_size)
+
+  if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
+    cutorch.setDevice(opt.gpuid2)
+    local context2 = context_proto2[{{1, K}, {1, source_l}}]
+    context2:copy(context)
+    context = context2
+  end
+
+  out_float = torch.FloatTensor()
+
+  local i = 1
+  local done = false
+  local max_score = -1e9
+  local found_eos = false
+
+  while (not done) and (i < n) do
+    i = i+1
+    states[i] = {}
+    attn_argmax[i] = {}
+    local decoder_input1
+    if model_opt.use_chars_dec == 1 then
+      decoder_input1 = word2charidx_targ:index(1, next_ys:narrow(1,i-1,1):squeeze())
+    else
+      decoder_input1 = next_ys:narrow(1,i-1,1):squeeze()
+      if opt.beam == 1 then
+        decoder_input1 = torch.LongTensor({decoder_input1})
+      end
+    end
+    local decoder_input
+    if model_opt.attn == 1 then
+      decoder_input = {decoder_input1, context, table.unpack(rnn_state_dec)}
+    else
+      decoder_input = {decoder_input1, context[{{}, source_l}], table.unpack(rnn_state_dec)}
+    end
+    local out_decoder = model[2]:forward(decoder_input)
+    local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+
+    rnn_state_dec = {} -- to be modified later
+    if model_opt.input_feed == 1 then
+      table.insert(rnn_state_dec, out_decoder[#out_decoder])
+    end
+    for j = 1, #out_decoder - 1 do
+      table.insert(rnn_state_dec, out_decoder[j])
+    end
+    out_float:resize(out:size()):copy(out)
+    for k = 1, K do
+      State.disallow(out_float:select(1, k))
+      out_float[k]:add(scores[i-1][k])
+    end
+    -- All the scores available.
+
+    local flat_out = out_float:view(-1)
+    if i == 2 then
+      flat_out = out_float[1] -- all outputs same for first batch
+    end
+
+    if model_opt.start_symbol == 1 then
+      decoder_softmax.output[{{},1}]:zero()
+      decoder_softmax.output[{{},source_l}]:zero()
+    end
+
+    for k = 1, K do
+      while true do
+        local score, index = flat_out:max(1)
+        local score = score[1]
+        local prev_k, y_i = flat_to_rc(out_float, index[1])
+        states[i][k] = State.advance(states[i-1][prev_k], y_i)
+        local diff = true
+        for k2 = 1, k-1 do
+          if State.same(states[i][k2], states[i][k]) then
+            diff = false
+          end
+        end
+
+        if i < 2 or diff then
+          if model_opt.attn == 1 then
+            max_attn, max_index = decoder_softmax.output[prev_k]:max(1)
+            attn_argmax[i][k] = State.advance(attn_argmax[i-1][prev_k],max_index[1])
+          end
+          prev_ks[i][k] = prev_k
+          next_ys[i][k] = y_i
+          scores[i][k] = score
+          flat_out[index[1]] = -1e9
+          break -- move on to next k
+        end
+        flat_out[index[1]] = -1e9
+      end
+    end
+    for j = 1, #rnn_state_dec do
+      rnn_state_dec[j]:copy(rnn_state_dec[j]:index(1, prev_ks[i]))
+    end
+    end_hyp = states[i][1]
+    end_score = scores[i][1]
+    if model_opt.attn == 1 then
+      end_attn_argmax = attn_argmax[i][1]
+    end
+    if end_hyp[#end_hyp] == END then
+      done = true
+      found_eos = true
+    else
+      for k = 1, K do
+        local possible_hyp = states[i][k]
+        if possible_hyp[#possible_hyp] == END then
+          found_eos = true
+          if scores[i][k] > max_score then
+            max_hyp = possible_hyp
+            max_score = scores[i][k]
+            if model_opt.attn == 1 then
+              max_attn_argmax = attn_argmax[i][k]
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local best_mscore = -1e9
+  local mscore_hyp
+  local mscore_scores
+  local mscore_attn_argmax
+  local gold_table
+  if opt.rescore ~= '' then
+    gold_table = gold[{{2, gold:size(1)-1}}]:totable()
+    for k = 1, K do
+        local hyp={}
+        for _,v in pairs(states[i][k]) do
+          if v == END then break; end
+          table.insert(hyp,v)
+        end
+        table.insert(hyp, END)
+        local score_k = scorers[opt.rescore](hyp, gold_table, opt.rescore_param)
+        if score_k > best_mscore then
+          mscore_hyp = hyp
+          mscore_scores = scores[i][k]
+          best_mscore = score_k
+          mscore_attn_argmax = attn_argmax[i][k]
+        end
+    end
+  end
+
+  local gold_score = 0
+  if opt.score_gold == 1 then
+    rnn_state_dec = {}
+    for i = 1, #init_fwd_dec do
+      table.insert(rnn_state_dec, init_fwd_dec[i][{{1}}]:zero())
+    end
+    if model_opt.init_dec == 1 then
+      rnn_state_dec = rnn_state_dec_gold
+    end
+    local target_l = gold:size(1)
+    for t = 2, target_l do
+      local decoder_input1
+      if model_opt.use_chars_dec == 1 then
+        decoder_input1 = word2charidx_targ:index(1, gold[{{t-1}}])
+      else
+        decoder_input1 = gold[{{t-1}}]
+      end
+      local decoder_input
+      if model_opt.attn == 1 then
+        decoder_input = {decoder_input1, context[{{1}}], table.unpack(rnn_state_dec)}
+      else
+        decoder_input = {decoder_input1, context[{{1}, source_l}], table.unpack(rnn_state_dec)}
+      end
+      local out_decoder = model[2]:forward(decoder_input)
+      local out = model[3]:forward(out_decoder[#out_decoder]) -- K x vocab_size
+      rnn_state_dec = {} -- to be modified later
+      if model_opt.input_feed == 1 then
+        table.insert(rnn_state_dec, out_decoder[#out_decoder])
+      end
+      for j = 1, #out_decoder - 1 do
+        table.insert(rnn_state_dec, out_decoder[j])
+      end
+      gold_score = gold_score + out[1][gold[t]]
+    end
+  end
+  if opt.simple == 1 or end_score > max_score or not found_eos then
+    max_hyp = end_hyp
+    max_score = end_score
+    max_attn_argmax = end_attn_argmax
+  end
+
+  local best_hyp=states[i]
+  local best_scores=scores[i]
+  local best_attn_argmax=attn_argmax[i]
+  if opt.rescore ~= '' then
+    local max_mscore = scorers[opt.rescore](max_hyp, gold_table, opt.rescore_param)
+    print('RESCORE MAX '..opt.rescore..': '..max_mscore, 'BEST '..opt.rescore..': '..best_mscore)
+    max_hyp=mscore_hyp
+    max_score=best_mscore
+    max_attn_argmax=mscore_attn_argmax
+    best_hyp=mscore_hyp
+    best_scores=mscore_scores
+    best_attn_argmax=mscore_attn_argmax
+  end
+
+  return max_hyp, max_score, max_attn_argmax, gold_score, best_hyp, best_scores, best_attn_argmax
+end
+
+
 function idx2key(file)
   local f = io.open(file,'r')
   local t = {}
@@ -642,6 +1177,8 @@ function init(arg)
 
   -- load model and word2idx/idx2word dictionaries
   model, model_opt = checkpoint[1], checkpoint[2]
+  
+  opt.model_opt = model_opt
   for i = 1, #model do
     model[i]:cuda() -- remove for compatability if needed
     model[i]:evaluate()
@@ -779,6 +1316,57 @@ function search(line)
   pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
 
   print('PRED ' .. sent_id .. ': ' .. pred_sent)
+  
+  if gold ~= nil then
+    print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
+    if opt.score_gold == 1 then
+      print(string.format("PRED SCORE: %.4f, GOLD SCORE: %.4f", pred_score, gold_score))
+      gold_score_total = gold_score_total + gold_score
+      gold_words_total = gold_words_total + target:size(1) - 1
+    end
+  end
+
+  nbests = {}
+
+  if opt.n_best > 1 then
+    for n = 1, opt.n_best do
+      pred_sent_n = wordidx2sent(all_sents[n], idx2word_targ, source_str, all_attn[n], false)
+      local out_n = string.format("%d ||| %s ||| %.4f", n, pred_sent_n, all_scores[n])
+      print(out_n)
+      nbests[n] = out_n
+    end
+  end
+
+  print('')
+
+  return pred_sent, nbests
+end
+
+function search_with_mask(line, mask)
+  sent_id = sent_id + 1
+  local cleaned_tokens, source_features_str = extract_features(line)
+  local cleaned_line = table.concat(cleaned_tokens, ' ')
+  print('SENT ' .. sent_id .. ': ' ..line)
+  local source, source_str
+  local source_features = features2featureidx(source_features_str, feature2idx_src, model_opt.start_symbol)
+  if model_opt.use_chars_enc == 0 then
+    source, source_str = sent2wordidx(cleaned_line, word2idx_src, model_opt.start_symbol)
+  else
+    source, source_str = sent2charidx(cleaned_line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
+  end
+  if gold then
+    target, target_str = sent2wordidx(gold[sent_id], word2idx_targ, 1)
+  end
+  
+  state = State.initial(START)
+  pred, pred_score, attn, gold_score, all_sents, all_scores, all_attn = generate_beam_with_mask(model,
+    state, opt.beam, MAX_SENT_L, source, source_features, target, mask)
+  pred_score_total = pred_score_total + pred_score
+  pred_words_total = pred_words_total + #pred - 1
+  pred_sent = wordidx2sent(pred, idx2word_targ, source_str, attn, true)
+
+  print('PRED ' .. sent_id .. ': ' .. pred_sent)
+  
   if gold ~= nil then
     print('GOLD ' .. sent_id .. ': ' .. gold[sent_id])
     if opt.score_gold == 1 then
@@ -1006,5 +1594,6 @@ return {
   search = search,
   encode = encode,
   decode = decode,
+  search_with_mask = search_with_mask,
   getOptions = getOptions
 }

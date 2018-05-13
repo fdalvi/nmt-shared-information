@@ -4,8 +4,26 @@ Shared Information between Hidden Representations in NMT
 
 This repository contains code to measure the amount of shared information between hidden encoder-side representations in neural machine translation models.
 
-Usage
-=====
+Usage: Masking
+==============
+Use `evaluate_with_mask.lua` to mask out certain neurons. The only additional required parameter is a comma separated list of numbers for the `-mask` option. 
+
+```bash
+th evaluate_with_mask.lua -model XYZ.t7 -src_dict XYZ.src.dict -targ_dict XYZ.targ.dict -src_file XYZ.tok -output_file XYZ.t7
+	-mask 0,122,1563
+```
+
+The numbers are neuron IDs, mapped as follows:
+- `0-rnn_size`: layer 1
+- `rnn_size-rnn_size*2`: layer 2
+- `rnn_size*2-rnn_size*3`: layer 3
+- ...
+- `rnn_size*num_layers-rnn_size*(num_layers+1)`: backward rnn layer 1
+- `rnn_size*(num_layers+1)-rnn_size*(num_layers+2)`: backward rnn layer 2
+- ...
+
+Usage: Description Extraction
+=============================
 
 First, train a model according to [documentation for seq2seq-attn](https://github.com/harvardnlp/seq2seq-attn).
 
