@@ -24,7 +24,9 @@ th describe.lua -model XYZ.t7 -src_dict XYZ.src.dict -targ_dict XYZ.targ.dict -s
 th describe.lua -model XYZ.t7 -src_dict XYZ.src.dict -targ_dict XYZ.targ.dict -src_file XYZ.tok -output_file XYZ.t7 -enc_layer 1
 ```
 
-Note: a network with `n` LSTM layers has `2n` hidden layers; each LSTM layer has a memory cell and a hidden cell. Odd layer numbers denote memory cells, and even layer numbers denote the hidden cells, in forward pass order.
+Notes: 
+- a network with `n` LSTM layers has `2n` hidden layers; each LSTM layer has a memory cell and a hidden cell. Odd layer numbers denote memory cells, and even layer numbers denote the hidden cells, in forward pass order.
+- The default choice if no `-enc_layer` is specified is to include activations from _all_ layers
 
 All of the options `describe.lua` takes are:
 
