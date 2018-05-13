@@ -852,7 +852,21 @@ function encode(line, layer)
   for i = 1, #init_fwd_enc do
     table.insert(rnn_state_enc, init_fwd_enc[i]:zero():cuda())
   end
-  local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+
+  local context_size = model_opt.rnn_size
+
+  -- Increase context_size if we care about all layers
+  if layer == nil or layer < 0 then 
+    context_size = context_size * model_opt.num_layers
+  end
+
+  local context = torch.zeros(1, source_l, context_size)
+
+  -- We will also keep track of bwd_context in case of brnn model
+  local backward_context
+  if model_opt.brnn == 1 then
+    backward_context = torch.zeros(1, source_l, context_size)
+  end
 
   -- Iterate through the source
   for t = 1, source_l do
@@ -863,16 +877,61 @@ function encode(line, layer)
       append_table(encoder_input, source_features[t])
     end
     -- Add all of the pieces of RNN state
-    append_table(encoder_input, rnn_state_enc)
+    append_table(encoder_input, rnn_state_enc) 
 
     -- Run one layer forward
     local out = model[1]:forward(encoder_input)
     rnn_state_enc = out
-    if layer == nil or layer < 0 then layer = #out end -- By default take the last element
-    context[{{},t}]:copy(out[layer])
+
+    local final_res
+    if layer == nil or layer < 0 then
+      -- By default combine all layers
+      hidden_states = {}
+      for h = 1, #out/2 do
+        table.insert(hidden_states, out[h*2])
+      end
+      final_res = torch.cat(hidden_states)
+    else
+      final_res = out[layer]
+    end 
+    context[{{},t}]:copy(final_res)
   end
 
-  return context, rnn_state_enc
+  -- Handle bidirectional rnn's
+  if model_opt.brnn == 1 then
+    for i = 1, #rnn_state_enc do
+      rnn_state_enc[i]:zero()
+    end
+    for t = source_l, 1, -1 do
+      local encoder_input = {source_input[t]}
+      if model_opt.num_source_features > 0 then
+        append_table(encoder_input, source_features[t])
+      end
+      append_table(encoder_input, rnn_state_enc)
+      local out = model[4]:forward(encoder_input)
+      rnn_state_enc = out
+
+      local final_res
+      if layer == nil or layer < 0 then
+        -- By default combine all layers
+        hidden_states = {}
+        for h = 1, #out/2 do
+          table.insert(hidden_states, out[h*2])
+        end
+        final_res = torch.cat(hidden_states)
+      else
+        final_res = out[layer]
+      end 
+      backward_context[{{},t}]:copy(final_res)
+    end
+  end
+
+  -- combined fwd and bwd contexts
+  if model_opt.brnn == 1 then
+    context = torch.cat({context, backward_context}, 3)
+  end
+
+  return context, rnn_state_enc 
 end
 
 function decode(input, output)
