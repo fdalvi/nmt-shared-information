@@ -2,8 +2,8 @@ require 'nn'
 require 'string'
 require 'nngraph'
 
-require 'cutorch'
-require 'cunn'
+--require 'cutorch'
+--require 'cunn'
 
 require 's2sa.models'
 require 's2sa.data'

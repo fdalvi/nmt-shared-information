@@ -2,7 +2,7 @@
 
 local beam = require 's2sa.beam'
 
-function string:split(sep)
+function string:_split(sep)
    local sep, fields = sep or ":", {}
    local pattern = string.format("([^%s]+)", sep)
    self:gsub(pattern, function(c) fields[#fields+1] = c end)
@@ -28,7 +28,7 @@ function main()
     end
   end
 
-  local neurons_to_mask = opt.mask:split(",")
+  local neurons_to_mask = opt.mask:_split(",")
   for i = 1, #neurons_to_mask do
     print("Masking",neurons_to_mask[i])
     local n = tonumber(neurons_to_mask[i])
