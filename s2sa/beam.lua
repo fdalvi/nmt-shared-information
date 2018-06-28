@@ -18,7 +18,8 @@ local cmd = torch.CmdLine()
 
 -- file location
 cmd:option('-model', 'seq2seq_lstm_attn.t7.', [[Path to model .t7 file]])
-cmd:option('-enc_layer', -1, [[For encoding generation, the encoding layer to extract]])
+cmd:option('-extract', 'enc', [[For encoding generation, the nmt module to extract (enc/dec)]])
+cmd:option('-extract_layer', -1, [[For encoding generation, the encoding layer to extract]])
 cmd:option('-src_file', '', [[Source sequence to decode (one line per sequence)]])
 cmd:option('-targ_file', '', [[True target sequence (optional)]])
 cmd:option('-output_file', 'pred.txt', [[Path to output the predictions (each line will be the decoded sequence]])
@@ -1519,70 +1520,158 @@ function encode(line, layer)
     context = torch.cat({context, backward_context}, 3)
   end
 
-  return context, rnn_state_enc 
+  return context
 end
 
-function decode(input, output)
-  -- Get true encoder context
-  local context, last_cell = encode(input, nil)
-
-  if context == nil then return nil end
-
-  context = context:cuda()
-  for i=1,#last_cell do
-    last_cell[i] = last_cell[i]:cuda()
-  end
-
-  -- Get tokens from string
-  local cleaned_tokens, source_features_str = extract_features(output)
-  local cleaned_line = table.concat(cleaned_tokens, ' ')
-
-  -- Create the target
-  local target, target_str = sent2wordidx(cleaned_line, word2idx_targ, 1)
-
-  -- Use the correct gpu if specified
+function decode(source_line, target_line, layer)
+  -- Not using `encode` here for greater efficiency
   if opt.gpuid >= 0 and opt.gpuid2 >= 0 then
     cutorch.setDevice(opt.gpuid)
   end
 
-  local target_l = target:size(1)
+  -- source
+  local cleaned_tokens, source_features_str = extract_features(source_line)
+  local cleaned_line = table.concat(cleaned_tokens, ' ')
 
-  local target_input = target:view(target_l, 1):cuda()
-
-  print('Last cell as', #last_cell)
-
-  -- Use the last cell of the encoder as the first
-  -- cell of the decoder
-  local rnn_state = last_cell
-  if model_opt.input_feed == 1 then
-    table.insert(rnn_state, 1, last_cell[1]:clone():zero()) -- Put another zeroed hidden vector at the start
+  -- Create the source vectors
+  local source, source_str
+  local source_features = features2featureidx(source_features_str, feature2idx_src, model_opt.start_symbol)
+  if model_opt.use_chars_enc == 0 then
+    source, source_str = sent2wordidx(cleaned_line, word2idx_src, model_opt.start_symbol)
+  else
+    source, source_str = sent2charidx(cleaned_line, char2idx, model_opt.max_word_l, model_opt.start_symbol)
   end
 
-  local concatenated_decoder_context = torch.Tensor(
-    target_l,
-    model_opt.rnn_size * #rnn_state
-  )
+  -- Create target vector
+  target, target_str = sent2wordidx(target_line, word2idx_targ, 1)
 
+  -- Cap source length
+  -- local source_l
+  -- if source:size(1) > opt.max_sent_l then
+  --   return nil
+  -- else
+  --   source_l = source:size(1)
+  -- end
+  local source_l = math.min(source:size(1), opt.max_sent_l)
+  source = source[{{1,source_l}}]
+
+  -- Cap target length
+  local target_l
+  if target:size(1) > opt.max_sent_l then
+    return nil
+  else
+    target_l = target:size(1)
+  end
+
+  local source_input
+  if model_opt.use_chars_enc == 1 then
+    source_input = source:view(source_l, 1, source:size(2)):contiguous()
+  else
+    source_input = source:view(source_l, 1)
+  end
+
+  local rnn_state_enc = {}
+  for i = 1, #init_fwd_enc do
+    table.insert(rnn_state_enc, init_fwd_enc[i]:zero())
+  end
+  local context = context_proto[{{}, {1,source_l}}]:clone() -- 1 x source_l x rnn_size
+
+  for t = 1, source_l do
+    local encoder_input = {source_input[t]}
+    append_table(encoder_input, rnn_state_enc)
+    local out = model[1]:forward(encoder_input)
+    rnn_state_enc = out
+    context[{{},t}]:copy(out[#out])
+  end
+  rnn_state_dec = {}
+
+  for i = 1, #init_fwd_dec do
+    table.insert(rnn_state_dec, init_fwd_dec[i][{{1}}]:zero())
+  end
+
+  if model_opt.init_dec == 1 then
+    for L = 1, model_opt.num_layers do
+      rnn_state_dec[L*2-1+model_opt.input_feed]:copy(rnn_state_enc[L*2-1])
+      rnn_state_dec[L*2+model_opt.input_feed]:copy(rnn_state_enc[L*2])
+    end
+  end
+
+  if model_opt.brnn == 1 then
+    for i = 1, #rnn_state_enc do
+      rnn_state_enc[i]:zero()
+    end
+    for t = source_l, 1, -1 do
+      local encoder_input = {source_input[t]}
+      append_table(encoder_input, rnn_state_enc)
+      local out = model[4]:forward(encoder_input)
+      rnn_state_enc = out
+      context[{{},t}]:add(out[#out])
+    end
+    if model_opt.init_dec == 1 then
+      for L = 1, model_opt.num_layers do
+        rnn_state_dec[L*2-1+model_opt.input_feed]:add(rnn_state_enc[L*2-1])
+        rnn_state_dec[L*2+model_opt.input_feed]:add(rnn_state_enc[L*2])
+      end
+    end
+  end
+
+  context = context:expand(1, source_l, model_opt.rnn_size)
+
+  -- Start decoder pass
+  local context_size = model_opt.rnn_size
+
+  -- Increase context_size if we care about all layers
+  if layer == nil or layer < 0 then 
+    context_size = context_size * model_opt.num_layers
+  end
+
+  local encoding = torch.zeros(1, target_l-2, context_size)
+
+  -- local target = target:view(target_l, 1, 1)
+
+  local decoder_input
   for t = 1, target_l do
-    -- Attention input
-    local decoder_input = {target_input[t], context, table.unpack(rnn_state)}
+
+    local decoder_input
+    if model_opt.attn == 1 then
+      decoder_input = {target[{{t}}], context[{{1}}], table.unpack(rnn_state_dec)}
+    else
+      decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec)}
+    end
 
     local out = model[2]:forward(decoder_input)
 
-    rnn_state = {}
-    if model_opt.input_feed == 1 then
-      table.insert(rnn_state, out[#out])
-    end
-    for j = 1, #out-1 do
-      table.insert(rnn_state, out[j])
+    -- Save context
+    if t ~= 1 and t ~= target_l then
+      local final_res
+      if layer == nil or layer < 0 then
+        -- By default combine all layers
+        hidden_states = {}
+        for h = 1, #out/2 do
+          table.insert(hidden_states, out[h*2])
+        end
+        final_res = torch.cat(hidden_states)
+      else
+        final_res = out[layer]
+      end 
+      encoding[{{},t-1}]:copy(final_res)
     end
 
-    for i = 1, #out do
-      concatenated_decoder_context[t]:narrow(1, (i - 1) * model_opt.rnn_size + 1, model_opt.rnn_size):copy(out[i])
+    local out_pred_idx = #out
+    if model_opt.guided_alignment == 1 then
+      out_pred_idx = #out-1
     end
+    local next_state = {}
+    if model_opt.input_feed == 1 then
+      table.insert(next_state, out[out_pred_idx])
+    end
+    for j = 1, out_pred_idx-1 do
+      table.insert(next_state, out[j])
+    end
+    rnn_state_dec = next_state
   end
 
-  return concatenated_decoder_context
+  return encoding
 end
 
 function getOptions()
