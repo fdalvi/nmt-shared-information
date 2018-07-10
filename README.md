@@ -36,15 +36,22 @@ Then invoke `describe.lua` like so:
 th describe.lua -model XYZ.t7 -src_dict XYZ.src.dict -targ_dict XYZ.targ.dict -src_file XYZ.tok -output_file XYZ.t7
 ```
 
-`describe.lua` has an additional option specifying the layer to take
+By default, `describe.lua` extracts all layers from the encoder (and will return activations for `num_layers` x `num_directions` neurons). 
+`describe.lua` has an the following additional options to control this:
 
-```bash
-th describe.lua -model XYZ.t7 -src_dict XYZ.src.dict -targ_dict XYZ.targ.dict -src_file XYZ.tok -output_file XYZ.t7 -enc_layer 1
+Extract either from the encoder or decoder:
+```
+-extract 'enc'
+-extract 'dec'
 ```
 
-Notes: 
-- a network with `n` LSTM layers has `2n` hidden layers; each LSTM layer has a memory cell and a hidden cell. Odd layer numbers denote memory cells, and even layer numbers denote the hidden cells, in forward pass order.
-- The default choice if no `-enc_layer` is specified is to include activations from _all_ layers
+Extract a single layer:
+```bash
+-extract_layer 1  # Extract layer 1 
+-extract_layer 2  # Extract layer 2 
+-extract_layer -1 # Extract all layers 
+```
+(The default choice is all layers if no `extract_layer` parameter is specified.
 
 All of the options `describe.lua` takes are:
 
@@ -54,7 +61,8 @@ All of the options `describe.lua` takes are:
 -targ_dict
 -src_file
 -output_file
--enc_layer
+-extract
+-extract_layer
 ```
 
 You will want to generate a description file for each of the models you want to compare. To be compared, description files must be generated on the same `-src_file`.
