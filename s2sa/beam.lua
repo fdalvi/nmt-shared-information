@@ -1404,7 +1404,7 @@ function encode(line, layer)
   local cleaned_tokens, source_features_str = extract_features(line)
   local cleaned_line = table.concat(cleaned_tokens, ' ')
 
-  print('SENT: ' ..line)
+  -- print('SENT: ' ..line)
 
   -- Create the source vectors
   local source, source_str
@@ -1623,6 +1623,9 @@ function decode(source_line, target_line, layer)
   -- Increase context_size if we care about all layers
   if layer == nil or layer < 0 then 
     context_size = context_size * model_opt.num_layers
+
+    -- DEBUG code to extract cell states as well
+    -- context_size = context_size * model_opt.num_layers * 2 + context_size
   end
 
   local encoding = torch.zeros(1, target_l-2, context_size)
@@ -1635,11 +1638,24 @@ function decode(source_line, target_line, layer)
     local decoder_input
     if model_opt.attn == 1 then
       decoder_input = {target[{{t}}], context[{{1}}], table.unpack(rnn_state_dec)}
+
+      -- Debug statements
+      -- print('Target',target[{{t}}])
+      -- print('Context',context[{{1}}]:sum())
+      -- for i = 1, #init_fwd_dec do
+      --   print('In State',i, rnn_state_dec[i]:sum())
+      -- end
     else
       decoder_input = {target[t], context[{{}, source_l}], table.unpack(rnn_state_dec)}
     end
 
     local out = model[2]:forward(decoder_input)
+
+    -- Debug statements
+    -- for i = 1, #out do
+    --  print('Out:',i,out[i]:sum())
+    -- end
+    -- print(out)
 
     -- Save context
     if t ~= 1 and t ~= target_l then
@@ -1650,10 +1666,15 @@ function decode(source_line, target_line, layer)
         for h = 1, #out/2 do
           table.insert(hidden_states, out[h*2])
         end
+
+        -- DEBUG code to extract cell states as well
+        --for h = 1, #out do
+        --  table.insert(hidden_states, out[h])
+        --end
         final_res = torch.cat(hidden_states)
       else
         final_res = out[layer]
-      end 
+      end
       encoding[{{},t-1}]:copy(final_res)
     end
 
