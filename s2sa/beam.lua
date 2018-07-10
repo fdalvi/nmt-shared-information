@@ -1509,7 +1509,7 @@ function encode(line, layer)
         end
         final_res = torch.cat(hidden_states)
       else
-        final_res = out[layer]
+        final_res = out[layer*2]
       end 
       backward_context[{{},t}]:copy(final_res)
     end
@@ -1673,7 +1673,7 @@ function decode(source_line, target_line, layer)
         --end
         final_res = torch.cat(hidden_states)
       else
-        final_res = out[layer]
+        final_res = out[layer*2]
       end
       encoding[{{},t-1}]:copy(final_res)
     end
